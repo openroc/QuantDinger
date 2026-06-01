@@ -920,11 +920,29 @@ def get_positions():
             rows = cur.fetchall() or []
             cur.close()
 
-        # Live strategies: empty qd_strategy_positions means the exchange is flat
-        # (position sync deletes local rows). Do NOT replay trades here — that
-        # recreates "ghost" long/short rows and flickers on every refresh.
         execution_mode = str(st.get("execution_mode") or "signal").strip().lower()
-        if not rows and execution_mode != "live":
+        if execution_mode == "live":
+            try:
+                from app.services.live_trading.strategy_position_sync import sync_strategy_positions_from_exchange
+
+                sync_strategy_positions_from_exchange(strategy_id)
+                with get_db_connection() as db:
+                    cur = db.cursor()
+                    cur.execute(
+                        """
+                        SELECT id, strategy_id, symbol, side, size, entry_price, current_price, highest_price,
+                               unrealized_pnl, pnl_percent, equity, updated_at
+                        FROM qd_strategy_positions
+                        WHERE strategy_id = ?
+                        ORDER BY id DESC
+                        """,
+                        (strategy_id,),
+                    )
+                    rows = cur.fetchall() or []
+                    cur.close()
+            except Exception as e:
+                logger.warning("sync_strategy_positions_from_exchange failed for strategy %s: %s", strategy_id, e)
+        elif not rows:
             try:
                 from app.services.live_trading.records import rebuild_positions_from_trades
 

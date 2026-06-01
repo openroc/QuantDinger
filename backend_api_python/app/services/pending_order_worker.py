@@ -21,11 +21,11 @@ from app.services.live_trading.factory import create_client
 from app.services.live_trading.records import (
     apply_fill_to_local_position,
     ensure_position_ledger_schema,
-    lookup_exchange_side_qty,
     normalize_strategy_symbol,
     record_trade,
     strategy_allowed_symbols,
 )
+from app.services.live_trading.strategy_position_sync import apply_exchange_snapshot_to_strategy_ledger
 from app.services.live_trading.account_positions import (
     account_legs_from_exchange_maps,
     sync_account_positions,
@@ -921,45 +921,32 @@ class PendingOrderWorker:
                 else:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) has NO positions on exchange.")
 
-                # 3) L3 self-heal: delete local rows when exchange leg is flat.
-                # Do NOT insert/update strategy rows from account totals (multi-strategy credential safe).
-                to_delete_ids: List[int] = []
-                eps = 1e-12
-
-                for r in plist:
-                    rid = int(r.get("id") or 0)
-                    sym = str(r.get("symbol") or "").strip()
-                    side = str(r.get("side") or "").strip().lower()
-                    if not rid or not sym or side not in ("long", "short"):
-                        continue
-                    try:
-                        local_size = float(r.get("size") or 0.0)
-                    except Exception:
-                        local_size = 0.0
-
-                    exch_qty = lookup_exchange_side_qty(exch_size, sym, side)
-                    logger.debug(
-                        f"[PositionSync] Check ID={rid} {sym} {side}: local_sz={local_size}, exch_sz={exch_qty}"
+                # 3) L3 reconcile: upsert allowed strategy symbols from exchange;
+                # delete legs that are flat. Scoped to strategy_allowed_symbols only.
+                try:
+                    written = apply_exchange_snapshot_to_strategy_ledger(
+                        strategy_id=int(sid),
+                        strategy_config={
+                            "symbol": sc.get("symbol"),
+                            "trading_config": sc.get("trading_config") or {},
+                        },
+                        exch_size=exch_size,
+                        exch_entry_price=exch_entry_price,
+                        exch_inst_id=exch_inst_id,
+                        market_type=str(market_type or "swap"),
+                        exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
                     )
-
-                    if exch_qty <= eps:
-                        to_delete_ids.append(rid)
-
-                if not to_delete_ids:
-                    continue
-
-                with get_db_connection() as db:
-                    cur = db.cursor()
-                    for rid in to_delete_ids:
-                        cur.execute("DELETE FROM qd_strategy_positions WHERE id = %s", (int(rid),))
-                    db.commit()
-                    cur.close()
-
-                if to_delete_ids:
-                    logger.debug(
-                        "position sync: removed %s ghost positions for strategy_id=%s",
-                        len(to_delete_ids),
+                    if written:
+                        logger.debug(
+                            "position sync: upserted %s L3 legs for strategy_id=%s",
+                            written,
+                            sid,
+                        )
+                except Exception as l3_err:
+                    logger.warning(
+                        "position sync: L3 ledger apply failed strategy_id=%s: %s",
                         sid,
+                        l3_err,
                     )
             except Exception as e:
                 msg = str(e)
